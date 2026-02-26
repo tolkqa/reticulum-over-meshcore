@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Tests
+tests/
+test_*.py
+send_file_test.py
+
+# Test/personal scripts
+echo_client_large.py
+lxmf_chat.py
+
+# Screenshots (not used in README)
+img*.png
+
+# IDE
+.idea/
+.vscode/
+*.iws
+*.iml
+*.ipr
+
+# Claude Code
+.claude/
+
+# Pytest
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Java leftovers
+pom.xml
+target/
+.kotlin
