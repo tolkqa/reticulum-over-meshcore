@@ -12,6 +12,7 @@ MessageReader.handle_rx (reads only 4 bytes instead of full payload).
 import io
 import asyncio
 import inspect
+import random
 import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -234,8 +235,41 @@ class MeshCoreTransport:
 
         return self._run_coro(_init(), timeout=15)
 
-    SEND_RAW_RETRIES = 2
-    SEND_RAW_RETRY_DELAY = 1.0  # seconds between retries
+    def get_radio_params(self):
+        """Return radio parameters from the cached SELF_INFO fetched during connect().
+
+        The meshcore library calls send_appstart() internally on connection and
+        stores the result in self._mc._self_info — no extra round-trip needed.
+
+        Returns a dict with keys: radio_sf, radio_bw (kHz), radio_cr.
+        Returns None if the fields are not available.
+        """
+        try:
+            info = self._mc._self_info
+        except AttributeError:
+            log.warning("_self_info not available on MeshCore instance")
+            return None
+
+        if info is None:
+            log.warning("SELF_INFO not cached yet")
+            return None
+
+        if "radio_sf" not in info or "radio_bw" not in info or "radio_cr" not in info:
+            log.warning(f"SELF_INFO missing radio fields: {info}")
+            return None
+
+        log.info(
+            f"Radio params: SF={info['radio_sf']} BW={info['radio_bw']}kHz CR={info['radio_cr']}"
+        )
+        return {
+            "radio_sf": info["radio_sf"],
+            "radio_bw": info["radio_bw"],
+            "radio_cr": info["radio_cr"],
+        }
+
+    SEND_RAW_RETRIES = 3
+    SEND_RAW_RETRY_DELAY = 1.0   # base delay between retries (seconds)
+    SEND_RAW_RETRY_JITTER = 1.0  # max random jitter added to each retry delay
 
     def send_raw(self, payload: bytes, path: bytes = None):
         """Send raw data via CMD_SEND_RAW_DATA.
@@ -266,7 +300,8 @@ class MeshCoreTransport:
                     f"failed: {result.payload}"
                 )
                 if attempt < self.SEND_RAW_RETRIES - 1:
-                    await asyncio.sleep(self.SEND_RAW_RETRY_DELAY)
+                    delay = self.SEND_RAW_RETRY_DELAY + random.uniform(0, self.SEND_RAW_RETRY_JITTER)
+                    await asyncio.sleep(delay)
             log.error(f"Raw data send failed after {self.SEND_RAW_RETRIES} attempts")
             return False
 
@@ -402,6 +437,17 @@ class MeshCoreTransport:
         if not self._peer_paths:
             return None
         return min(self._peer_paths.values(), key=len)
+
+    def invalidate_path(self, path: bytes):
+        """Remove all peers whose cached path matches the given bytes.
+
+        Called after a directed TX failure so subsequent packets fall back
+        to flood until a PATH_UPDATE event restores a fresh route.
+        """
+        stale = [pk for pk, p in self._peer_paths.items() if p == path]
+        for pk in stale:
+            del self._peer_paths[pk]
+            log.info(f"Invalidated stale path {path.hex()} for peer {pk[:8]}")
 
     @property
     def peer_count(self):

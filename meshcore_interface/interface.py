@@ -31,9 +31,13 @@ from RNS.Interfaces.Interface import Interface
 from meshcore_interface.transport import MeshCoreTransport
 from meshcore_interface.fragmentation import Fragmenter, Reassembler
 
-# Delay between fragment transmissions (seconds).
-# LoRa SF12 BW125: ~168 byte packet ≈ 1.5-2s airtime + processing.
-INTER_FRAGMENT_DELAY = 2.5
+# TX rate-limit: drop a packet if the channel cannot have drained yet.
+# We track when the last TX finished and estimate the on-air time of the
+# previous packet from the known bitrate.  If the channel is still (likely)
+# busy we drop the new packet.  This prevents queue buildup during sustained
+# audio streaming where the audio generation rate can exceed LoRa capacity.
+# A safety margin of 0.8 means we drop when the gap is < 80% of airtime.
+TX_RATE_LIMIT_MARGIN = 0.8
 
 # Reconnection parameters
 RECONNECT_INITIAL_DELAY = 5    # seconds before first reconnect attempt
@@ -45,7 +49,18 @@ class MeshCoreInterface(Interface):
     """Reticulum interface bridging to MeshCore LoRa mesh network."""
 
     DEFAULT_IFAC_SIZE = 8
-    BITRATE_GUESS = 1200  # ~1.2 kbps estimate for LoRa SF12 BW125
+    BITRATE_GUESS = 1200  # fallback if radio params unavailable
+
+    @staticmethod
+    def _calc_lora_bitrate(sf, bw_khz, cr):
+        """Calculate LoRa bitrate in bps from radio parameters.
+
+        Args:
+            sf: Spreading factor (7-12)
+            bw_khz: Bandwidth in kHz (e.g. 125.0)
+            cr: Coding rate offset (1-4, representing 4/5 ... 4/8)
+        """
+        return int(sf * bw_khz * 1000 / (2 ** sf) * (4 / (4 + cr)))
 
     def __init__(self, owner, configuration):
         super().__init__()
@@ -83,6 +98,8 @@ class MeshCoreInterface(Interface):
         self._reassembler = Reassembler()
         self._reconnecting = False
         self._detached = False
+        self._last_tx_end = 0.0      # monotonic time when last TX completed
+        self._last_tx_bytes = 0      # size of last transmitted packet (for airtime est.)
 
         try:
             self._do_connect()
@@ -111,6 +128,23 @@ class MeshCoreInterface(Interface):
             f"[{self.name}] Querying device info...", RNS.LOG_DEBUG
         )
         self._transport.initialize()
+
+        radio = self._transport.get_radio_params()
+        if radio:
+            self.bitrate = self._calc_lora_bitrate(
+                radio["radio_sf"], radio["radio_bw"], radio["radio_cr"]
+            )
+            RNS.log(
+                f"[{self.name}] Radio: SF{radio['radio_sf']} BW{radio['radio_bw']}kHz "
+                f"CR4/{4 + radio['radio_cr']} → bitrate={self.bitrate} bps",
+                RNS.LOG_INFO,
+            )
+        else:
+            RNS.log(
+                f"[{self.name}] Could not read radio params, using fallback bitrate={self.bitrate} bps",
+                RNS.LOG_WARNING,
+            )
+
         self._transport.activate_subscriptions()
 
         # BLE connections need a brief warmup before TX is reliable.
@@ -192,6 +226,27 @@ class MeshCoreInterface(Interface):
         if not self.online:
             return
 
+        # Rate-limit DATA packets only. Announces (0x01), link requests (0x02),
+        # and proofs (0x03) are critical control packets that must go through
+        # immediately — dropping them breaks link establishment and routing.
+        # RNS header byte 0 bits 0-1 encode the packet type (with ifac_size=0).
+        _pkt_type = data[0] & 0x03 if data else 0
+        _is_data = (_pkt_type == 0x00)
+
+        if _is_data and self._last_tx_end > 0:
+            now = time.monotonic()
+            # Estimate on-air duration of the previous packet (bytes → bits / bps).
+            # Add 5-byte framing overhead from MeshCore CMD_SEND_RAW_DATA header.
+            prev_airtime = (self._last_tx_bytes + 5) * 8 / max(self.bitrate, 600)
+            elapsed = now - self._last_tx_end
+            if elapsed < prev_airtime * TX_RATE_LIMIT_MARGIN:
+                RNS.log(
+                    f"[{self.name}] TX rate-limited: dropping {len(data)}B "
+                    f"(elapsed {elapsed:.2f}s < {prev_airtime * TX_RATE_LIMIT_MARGIN:.2f}s threshold)",
+                    RNS.LOG_VERBOSE,
+                )
+                return
+
         try:
             fragments = self._fragmenter.fragment(data)
 
@@ -205,10 +260,29 @@ class MeshCoreInterface(Interface):
                 f"[{self.name}] TX {len(data)}B in {len(fragments)} fragment(s) [{route_desc}]",
                 RNS.LOG_VERBOSE,
             )
+            # Inter-fragment delay: must exceed the on-air time of one fragment
+            # so the channel is clear before we transmit the next one.
+            # Calculated from the live bitrate set after reading radio params.
+            # Fragment wire size = payload + 2-byte fragment header + 2-byte
+            # MeshCore CMD header = payload + 4.  Add 20% margin.
+            frag_airtime = (len(fragments[0]) + 4) * 8 / max(self.bitrate, 600) * 1.2
+
             for i, fragment in enumerate(fragments):
                 if i > 0:
-                    time.sleep(INTER_FRAGMENT_DELAY)
-                if not self._transport.send_raw(fragment, path=path):
+                    time.sleep(frag_airtime)
+                ok = self._transport.send_raw(fragment, path=path)
+                if not ok and path is not None:
+                    # Directed path failed — invalidate it and retry this
+                    # fragment via flood. Remaining fragments also use flood.
+                    RNS.log(
+                        f"[{self.name}] Directed TX failed, invalidating path "
+                        f"{path.hex()} and retrying via flood",
+                        RNS.LOG_WARNING,
+                    )
+                    self._transport.invalidate_path(path)
+                    path = None  # all remaining fragments will use flood
+                    ok = self._transport.send_raw(fragment, path=None)
+                if not ok:
                     RNS.log(
                         f"[{self.name}] Failed to send fragment {i+1}/{len(fragments)}",
                         RNS.LOG_ERROR,
@@ -219,6 +293,8 @@ class MeshCoreInterface(Interface):
                         self._schedule_reconnect()
                     return
             self.txb += len(data)
+            self._last_tx_end = time.monotonic()
+            self._last_tx_bytes = len(data)
 
         except Exception as e:
             RNS.log(f"[{self.name}] TX error: {e}", RNS.LOG_ERROR)
